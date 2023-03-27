@@ -1,0 +1,570 @@
+---
+title: "Assessing connectivity with package oSCR"
+author: "Olivier Gimenez"
+output:
+  html_document:
+    code_folding: show
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_depth: 2
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+date: "January 2021, March 2023"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      dpi = 300,
+                      cache = TRUE)
+```
+
+# Motivation
+
+In their 2017 paper, Dana Morin and colleagues used data collected on black bears in New York to explore connectivity issues with hair snare corral traps over 10 1-week occasions. They built on some previous work by Royle, Sutherland and colleagues in which spatial capture-recapture (SCR) models are used to infer connectivity (Royle et al. 2013, Sutherland et al. 2015).
+
+Briefly speaking, the method relies on standard SCR models in which the euclidean distance between activity centers and traps is replaced by an ecological distance with least-cost path distance that uses a landscape covariate to inform the model about how space is used. 
+
+In their appendix 3, the authors provide the data and some R code to fit a spatial capture-recapture model using ecological distance (vs. euclidian distance), calculate realized density and connectivity measures such potential connectivity and density-weighted connectivity. 
+
+Here, I try and reproduce their results using the R package `oSCR`.
+
+# Connectivity measures estimated from SCR data
+
+Morin and colleagues define potential connectivity as "a metric of the connectivity of areas based on resistance to individual movement". In details, this is "the expected number of individuals that might use a pixel (where the expectation is taken with respect to the population distribution of activity centers)". They note that "potential connectivity is proportional to the expected number of individuals that may use each pixel in the landscape and is a function of movement in response to the landscape including biological processes that may affect individual movement". 
+
+The authors then combine realized density and potential connectivity to produce density-weighted connectivity (DWC; or realized connectivity in Sutherland et al. 2015). "Density-weighted connectivity differs from potential connectivity in that instead of multiplying the contributions of focal pixels to the connectivity of surrounding pixels, it is weighted by the local population size". The authors note that "estimated DWC surface is a representation of the two critical processes required for population persistence, landscape connectivity, and density, estimated from data".
+
+They conclude: "the measures of connectivity proposed above are based on models both of how individuals in the population use space (the encounter probability model) and of how individuals are distributed in space (the density model). Furthermore, these measures can be estimated directly from encounter history data using SCR models, thus allowing for formal inference in the context of conventional animal population studies based on, for example, camera trapping. Therefore, it is of practical interest to assess how well DWC and related metrics can be estimated from field efforts that obtain capture-recapture data".
+
+# Re-run Dana Morin's script 
+
+Here I took the script in Appendix 3, slightly amended it to make it simpler and re-run it. 
+
+Connectivity example with NY Black Bear data from Dana Morin's paper. 
+```{r}
+library(tidyverse)
+theme_set(theme_light())
+library(raster)
+library(RColorBrewer)
+library(scrbook)
+library(gdistance)
+```
+
+Lload working space with capture data, trap locations, and habitat covariates (and a couple color palettes)
+```{r}
+load("dat/20161025_NY_URAM_asu example WS.RData")
+```
+
+Format trap location data. Reducing scale helps for convergence. 
+```{r}
+X <- cbind(trap.locs$x, trap.locs$y)/10000 
+```
+
+Plot covariates with location of traps. 
+```{r}
+par(mfrow=c(2,2))
+plot(red.cov.for,col=for.col, main="% forest")
+points(X,col="darkblue", pch="+")
+plot(red.cov.crop, col=col.yel[2:6], main="% crop") # % agricultural crops
+points(X,col="darkblue", pch="+")
+plot(red.cov.dev, col=rev(gray.colors(7)[1:5]), main= "% developed")
+points(X,col="darkblue", pch="+")
+plot(red.cov.elev,main="elevation") #scaled between 0 and 1
+points(X,col="darkblue", pch="+")
+par(mfrow=c(1,1))
+```
+
+Format spatial capture histories.
+```{r}
+caps.grid.matrix <- as.matrix(caps.grid)
+trap.deployed <- matrix(1,nrow=nrow(trap.locs), ncol=10)
+trap.bind <- cbind(1:nrow(trap.locs),trap.locs, trap.deployed)# 
+NYUR.trap.edf <- caps.grid.matrix 
+NYUR.trap.tdf <- trap.bind
+y3d <- SCR23darray(NYUR.trap.edf,NYUR.trap.tdf) #create 3d array for SCR
+y2d <- apply(y3d,c(1,2),sum) #sum to matrix
+K <- 10
+xy <- coordinates(red.cov.for)
+```
+
+
+Write down the likelihood function for negative resitance values. The covariate, here forest cover, is hypothesized to facilitate movement. Note that in appendix 3 of the paper, there's the positive resistance values counterpart.
+```{r}
+SCRed.DM.neg <- function(start = NULL, 
+                         y = y, 
+                         K = NULL, 
+                         X = traplocs,
+                         cov = cov,
+                         G = xy, 
+                         directions = 16, 
+                         model = "B", 
+                         dist = "ecol", 
+                         predict = FALSE){
+
+  SSarea <- nrow(G)
+  nG <- nrow(G)
+  
+  ## cost distance -- This (#~#) differs from Euclidean distance model  #~#
+  alpha2 <- start[4]                                              #~# start value provided 4th, not using exp() so can get negative values
+  cost <- exp(alpha2 * cov)                                             #~# have to provide a covariate layer
+  tr <- transition(cost, transitionFunction=function(x) (1/(mean(x))),  #~#
+                   direction = directions)                              #~#
+  trLayer <- geoCorrection(tr, scl = F)                                 #~#
+  D <- costDistance(trLayer,as.matrix(X),as.matrix(G))                  #~# calculate ecol dist between trap locs (X) and pixels
+  
+  alpha0 <- start[1]
+  alpha1 <- exp(start[2])
+  n0 <- exp(start[3])
+  probcap <- plogis(alpha0) * exp(-alpha1 * D * D)
+  Pm <- matrix(NA, nrow = nrow(probcap), ncol = ncol(probcap))
+  ymat <- y
+  ymat <- rbind(y, rep(0, ncol(y)))
+  lik.marg <- rep(NA, nrow(ymat))
+  for (i in 1:nrow(ymat)) {
+    Pm[1:length(Pm)] <- (dbinom(rep(ymat[i, ], nG), rep(K, 
+                                                        nG), probcap[1:length(Pm)], log = TRUE))
+    lik.cond <- exp(colSums(Pm))
+    lik.marg[i] <- sum(lik.cond * (1/nG))
+  }
+  if(predict==FALSE){
+    nv <- c(rep(1, length(lik.marg) - 1), n0)
+    part1 <- lgamma(nrow(y) + n0 + 1) - lgamma(n0 + 1)
+    part2 <- sum(nv * log(lik.marg))
+    out <- -1 * (part1 + part2)
+    attr(out, "SSarea") <- SSarea
+    return(out)
+  }
+  if(predict==TRUE){
+    posterior<-matrix(NA,nrow=nG,ncol=nrow(ymat))
+    for(i in 1:nrow(ymat)){
+      if(model=="B")
+        Pm[1:length(Pm)] <- (dbinom(rep(ymat[i, ], nG), rep(K, nG), probcap[1:length(Pm)], log = TRUE))
+      if(model=="P")
+        Pm[1:length(Pm)] <- (dpois(rep(ymat[i, ], nG), rep(K, nG)*probcap[1:length(Pm)], log = TRUE))
+      lik.cond <- exp(colSums(Pm))
+      posterior[,i]<- (lik.cond*(1/nG))/lik.marg[i]      # pr(s) = pr(y|s)*pr(s) / pr(y)
+    }
+    return(cbind(G,posterior))
+  }  
+}
+```
+
+Fit model with resistance to forest. This takes some time, so I run it once, save the results, then load them directly. 
+```{r eval = FALSE}
+NYUREcol.for.neglik1 <- nlm(f = SCRed.DM.neg, # function to minimize
+                            c(-2.5,log(2.15),log(130),-1), # inits
+                            hessian = TRUE, # compute SEs
+                            y = y2d, # encounter histories
+                            K = K, # nb of capture occasions
+                            X = X, # trap locations
+                            cov = red.cov.for, # covariate
+                            G = xy, # buffer
+                            directions = 16, # directions in which cells are connected
+                            model = "B", # binomial obs model
+                            dist = "ecol", # ecological distance
+                            predict = FALSE) 
+save(NYUREcol.for.neglik1, file = "output/byhand.RData")
+```
+
+Load the results. 
+```{r}
+load('output/byhand.RData')
+```
+
+Get 95% confidence intervals for $a2$.
+```{r}
+theta.hat <- NYUREcol.for.neglik1$estimate
+fish <- NYUREcol.for.neglik1$hessian
+conf.level <- 0.95
+crit <- qnorm((1 + conf.level)/2)
+inv.fish <- solve(fish)
+a2.CI <- theta.hat[4] + c(-1, 1) * crit * sqrt(inv.fish[4, 4])
+a2.CI #95% CIs
+```
+
+Get 95% intervals for N.
+```{r}
+log.n0.CI <- theta.hat[3] + c(-1, 1) * crit * sqrt(inv.fish[3, 3])
+exp(log.n0.CI)
+```
+
+Add to number of detected bears.
+```{r}
+nrow(y2d) + exp(log.n0.CI[1])
+nrow(y2d) + exp(log.n0.CI[2])
+```
+
+Predict realized density. Evaluate likelihood, at parameter estimates, with the predict = TRUE option. 
+```{r}
+NYUR.forneg1.pred <- SCRed.DM.neg(start = c(NYUREcol.for.neglik1$estimate[1], 
+                                            NYUREcol.for.neglik1$estimate[2],
+                                            NYUREcol.for.neglik1$estimate[3],
+                                            NYUREcol.for.neglik1$estimate[4]),
+                                  y = y2d,
+                                  K = K,
+                                  X = X,
+                                  cov = red.cov.for,
+                                  G = xy,
+                                  directions = 16, 
+                                  model = "B", 
+                                  dist = "ecol",
+                                  predict = TRUE)
+```
+
+Compute realized density and visualise it. 
+```{r}
+n0 <- exp(NYUREcol.for.neglik1$estimate[3]) # *******Set this to your estimate of n0
+xy.1 <- NYUR.forneg1.pred[,c(1,2)] #pixel coordinates
+dees <- NYUR.forneg1.pred[,-c(1,2)]
+dees[,ncol(dees)] <- dees[,ncol(dees)] * n0
+D.realized <- rasterFromXYZ(cbind(xy.1,apply(dees,1,sum)))
+plot(D.realized)
+dees.z <- cbind(xy.1,apply(dees,1,sum))
+```
+
+Estimate potential connectivity and DWC.
+```{r}
+a1 <- exp(NYUREcol.for.neglik1$estimate[2])
+a2 <- exp(NYUREcol.for.neglik1$estimate[4])
+cost.out <- exp(log(a2)*red.cov.for) # exp(a2*covariate) for positive resistance
+tr1.out <- transition(cost.out, transitionFunction = function(x)1/mean(x), directions = 16)
+tr1.out <- geoCorrection(tr1.out, type = "c", multpl = F, scl = F)
+dmat <- costDistance(tr1.out, coordinates(red.cov.for), coordinates(red.cov.for))
+potmat <- exp(-(a1)*dmat^2) # potential connectivity
+realmat <- t(dees.z[,3] * t(exp(-(a1)*dmat^2))) # realized connectivity
+```
+
+Plot it. First, crop surface so potential connectivity values on edges are not confusing.
+```{r}
+r.tmp <- red.cov.for
+extent(r.tmp)
+xmin.cr <- xmin(r.tmp) + 0.4 # 2*grain
+xmax.cr <- xmax(r.tmp) - 0.4
+ymin.cr <- ymin(r.tmp) + 0.4
+ymax.cr <- ymax(r.tmp) - 0.4
+extent(r.tmp) <- c(xmin.cr,xmax.cr,ymin.cr,ymax.cr)
+dwc.crop <- crop(rasterFromXYZ(cbind(coordinates(red.cov.for),rowSums(realmat))),r.tmp)
+pc.crop <- crop(rasterFromXYZ(cbind(coordinates(red.cov.for),rowSums(potmat))),r.tmp)
+den.crop <- crop(D.realized,r.tmp)
+for.crop <- crop(red.cov.for,r.tmp)
+```
+
+Then plot. 
+```{r}
+#png(file="bear_forest_figure.png",width=400*2*2,height=400*2*1.73, res=288)
+par(mfrow=c(2,2), mar=c(3.1,3.1,3.1,5.6),oma=c(0,0,0,0),xpd=T)
+
+# forest cover
+plot(for.crop, legend = FALSE, col = for.col, cex.axis = 0.75)
+title(xlab="Easting", line = 1.75, cex.lab = 0.75) 
+title(ylab="Northing", line = 2, cex.lab = 0.75) 
+title(main="a) Forest Covariate", line = 0.75, cex.main = 1)
+plot(for.crop, legend.only=TRUE, legend.shrink=1, legend.width=2, zlim=c(min(values(for.crop)), max(values(for.crop))),
+     col=for.col,
+     axis.args=list(cex.axis=0.75))
+
+# realized density
+plot(den.crop, 
+     legend=FALSE,col=rev(bluemono[1:7]),cex.axis=0.75)
+title(xlab="Easting", line= 1.75,cex.lab=0.75) 
+title(ylab="Northing", line= 2,cex.lab=0.75) 
+title(main="b) Realized Density", line=0.75,cex.main=1)
+plot(den.crop, legend.only=TRUE, legend.shrink=1, legend.width=2, zlim=c(min(values(den.crop)), max(values(den.crop))),
+     col=rev(bluemono[1:7]),
+     axis.args=list(cex.axis=0.75))
+
+# potential connectivity
+plot(pc.crop,
+     legend=FALSE,col=heat.colors(7),cex.axis=0.75)
+title(xlab="Easting", line= 1.75,cex.lab=0.75) 
+title(ylab="Northing", line= 2,cex.lab=0.75) 
+title(main="c) Potential Connectivity", line=0.75,cex.main=1)
+plot(pc.crop, legend.only=TRUE, legend.shrink=1, legend.width=2, zlim=c(min(values(pc.crop)), max(values(pc.crop))),
+     col=heat.colors(7),
+     axis.args=list(cex.axis=0.75,at=pretty(min(values(pc.crop)):max(values(pc.crop))),labels=pretty(pretty(min(values(pc.crop)):max(values(pc.crop))))))
+
+# density-weighted connectivity
+plot(dwc.crop,
+     legend=FALSE,col=rev(greenmono[1:7]),cex.axis=0.75)
+title(xlab="Easting", line= 1.75,cex.lab=0.75) 
+title(ylab="Northing", line= 2,cex.lab=0.75) 
+title(main="d) DWC", line=0.75,cex.main=1)
+plot(dwc.crop, legend.only=TRUE, legend.shrink=1, legend.width=2, zlim=c(min(values(dwc.crop)), max(values(dwc.crop))),
+     col=rev(greenmono[1:7]),
+     axis.args=list(cex.axis=0.75,at=pretty(0:max(values(dwc.crop))),labels=pretty(0:max(values(dwc.crop)))))
+
+#dev.off()
+```
+
+# Same thing with `oSCR`
+
+Here I try and reproduce the nice 4-panel figure from above, now with package `oSCR`. I proceed as if the data hadn't been loaded and formatted previously. 
+
+Load package. 
+```{r}
+library(oSCR)
+```
+
+```{r}
+load('dat/20161025_NY_URAM_asu example WS.RData')
+```
+
+Format spatial capture histories.
+```{r}
+caps.grid.matrix <- as.matrix(caps.grid)
+trap.deployed <- matrix(1,nrow = nrow(trap.locs), ncol = 10)
+trap.bind <- cbind(1:nrow(trap.locs),trap.locs/10000, trap.deployed)#
+NYUR.trap.edf <- caps.grid.matrix 
+NYUR.trap.tdf <- trap.bind
+K <- 10
+xy <- coordinates(red.cov.for)
+```
+
+Encounter data frame.
+```{r}
+head(NYUR.trap.edf)
+NYUR.trap.edf <- as.data.frame(NYUR.trap.edf)
+```
+
+Trap data. 
+```{r}
+head(NYUR.trap.tdf)
+NYUR.trap.tdf <- as.data.frame(NYUR.trap.tdf)
+```
+
+Number of capture occasions.
+```{r}
+K
+```
+
+Format edf/tdf.
+```{r}
+edf <- data.frame(session = NYUR.trap.edf$year, # add the session column
+                  ind = NYUR.trap.edf$ind, # row names are individual IDs
+                  occ = NYUR.trap.edf$day, #slice names are occasion IDs
+                  trap = NYUR.trap.edf$J)  # col names are trap IDs
+nocc <- K
+trapactiv <- NYUR.trap.tdf[,4:13]
+tdf <- data.frame(Trap_id = NYUR.trap.tdf$`1:nrow(trap.locs)`,
+                  X = NYUR.trap.tdf$x,
+                  Y = NYUR.trap.tdf$y,
+                  trapOperation = trapactiv)
+data <- data2oscr(edf = edf,
+                  tdf = list(tdf),
+                  sess.col = 1,
+                  id.col = 2,
+                  occ.col = 3,
+                  trap.col = 4,
+                  K = nocc,
+                  ntraps = nrow(tdf))
+```
+
+Explore.
+```{r}
+data$scrFrame
+```
+
+Visualise encounters.
+```{r} 
+sf <- data$scrFrame
+plot(sf, ax = FALSE, jit = 1)
+```
+
+Make buffer, and visualise it. We use the buffer provided. Alternatively, the function make.ssDF could be used. 
+```{r}
+xy <- as.data.frame(xy)
+df <- data.frame(X = xy$x,Y = xy$y, forest = red.cov.for@data@values)
+ss.buffer <- list(df) 
+class(ss.buffer) <- "ssDF" 
+```
+
+Plot state-space, traps and captures.
+```{r}
+plot(ss.buffer, sf, spider = TRUE) 
+```
+
+Chris Sutherland gave me a trick to speed up the calculations. When you are running models with several occasions but no time-varying covariates on detection, you can collapse the scrFrame to a single occasion and you can use the poisson encounter model to model the frequencies, this is an okay approximation, and works if all traps are checked in every occasion. 
+```{r}
+sf <- collapse.k(sf)
+```
+
+Aaaaaaaand fit! Start with model $M_0$ and euclidean distance. 
+```{r eval = FALSE}
+scr0 <- oSCR.fit(list(D ~ 1, p0 ~ 1, sig ~ 1), 
+                 scrFrame = sf, 
+                 ssDF = ss.buffer,
+                 encmod = "P", # to use Chris trick
+#                 encmod = "B",
+                 trimS = 4) 
+scr0
+```
+```{r echo = FALSE}
+load("output/oSCR_scr0.RData")
+scr0
+```
+
+
+Get estimated density.
+```{r}
+pred.df.dens <- data.frame(Session = factor(1))
+pred.dens <- get.real(scr0, 
+                      type = "dens", 
+                      newdata = pred.df.dens)
+pred.dens # D 
+```
+
+Get estimated abundance.
+```{r}
+pred.n <- get.real(scr0, 
+                   type = "dens", 
+                   newdata = pred.df.dens, 
+                   d.factor = nrow(scr0$ssDF[[1]]))
+pred.n # N 
+```
+
+Get estimated encounter probability at $d(x,s) = 0$.
+```{r}
+pred.df.det <- data.frame(Session = factor(1))
+pred.det <- get.real(scr0, type = "det", newdata = pred.df.det)
+pred.det # p0
+```
+
+Get estimated spatial scale parameter.
+```{r}
+pred.df.sig <- data.frame(Session = factor(1))
+pred.sig <- get.real(scr0, type = "sig", newdata = pred.df.sig)
+pred.sig # sigma
+```
+
+Realized density.
+```{r}
+pred <- predict.oSCR(scr0, sf, ss.buffer)
+plot(pred$r[[1]])
+points(tdf[,2:3], pch = 20)
+title("Realized density")
+```
+
+
+Now fit model with forest as cost surface. Let's display forest first.
+```{r}
+ss.buffer[[1]] %>%
+  ggplot(aes(x = X, y = Y, fill = forest)) +
+  geom_raster() +
+  scale_fill_gradientn(colours = viridis::viridis_pal(direction = -1)(20))
+```
+
+Then fit. 
+```{r eval = FALSE}
+scr1 <- oSCR.fit(model = list(D ~ 1, 
+                              p0 ~ 1, 
+                              sig ~ 1,
+                              asu ~ - 1 + forest),
+                 scrFrame = sf,
+                 ssDF = ss.buffer,
+                 costDF = ss.buffer,
+                 directions = 16,
+                 distmet = "ecol",
+                 encmod = "P",
+                 trimS = 4) # CAREFUL: conservative trimS is used
+scr1
+```
+```{r echo = FALSE}
+load("output/oSCR_scr1.RData")
+scr1
+```
+
+
+Get estimated density.
+```{r}
+pred.df.dens <- data.frame(Session = factor(1))
+pred.dens <- get.real(scr1, 
+                      type = "dens", 
+                      newdata = pred.df.dens)
+pred.dens # D 
+```
+
+Get estimated abundance.
+```{r}
+pred.n <- get.real(scr1, 
+                   type = "dens", 
+                   newdata = pred.df.dens, 
+                   d.factor = nrow(scr1$ssDF[[1]]))
+pred.n # N 
+```
+
+Get estimated encounter probability at $d(x,s) = 0$.
+```{r}
+pred.df.det <- data.frame(Session = factor(1))
+pred.det <- get.real(scr1, type = "det", newdata = pred.df.det)
+pred.det # p0
+```
+
+Get estimated spatial scale parameter.
+```{r}
+pred.df.sig <- data.frame(Session = factor(1))
+pred.sig <- get.real(scr1, type = "sig", newdata = pred.df.sig)
+pred.sig # sigma
+```
+
+Realized density.
+```{r}
+pred <- predict.oSCR(scr.fit = scr1, 
+                     scrFrame = sf, 
+                     ssDF = ss.buffer,
+                     costDF = ss.buffer,
+                     override.trim = TRUE)
+```
+
+Now to the connectivity measures. There is function connectivity.surface in `oSCR` that looks promising as it calculates the density-weighted connectivity. I'm using the lines of code from the function, but I'm going step by step to understand how it's done. Note that I have simplified the code to fit the example; the code is general and can handle sex-specific model. 
+```{r}
+a2 <- scr1$outStats[, "mle"][grep("c.beta", scr1$outStats[, "parameters"])]
+tmp.sig <- scr1$outStats[, "mle"][grep("sig", scr1$outStats[, "parameters"])]
+a1 <- 1/(2 * exp(tmp.sig)^2)
+cost <- exp(a2 * ss.buffer[[1]][,"forest"])
+costR <- rasterFromXYZ(cbind(ss.buffer[[1]][, c("X", "Y")], cost))
+tr <- transition(costR, transitionFunction = function(x) (1/(mean(x))), direction = 16)
+trLayer <- geoCorrection(tr, type = "c", multpl = F, scl = F)
+D <- costDistance(trLayer, 
+                  as.matrix(ss.buffer[[1]][, c("X", "Y")]), 
+                  as.matrix(ss.buffer[[1]][, c("X", "Y")]))
+dwc <- exp(-a1 * D^2) %*% (pred$ssN[[1]])
+pc <- exp(-a1 * D^2)
+```
+
+Visualize. 
+```{r}
+par(mfrow=c(2,2), mar=c(3.1,3.1,3.1,5.6),oma=c(0,0,0,0),xpd=T)
+
+# forest
+plot(red.cov.for,col=for.col, main="% forest")
+
+# realized density
+plot(pred$r[[1]], col=rev(bluemono[1:7]))
+title("Realized density")
+
+# potential connectivity.
+realmap2 <- brick(rasterFromXYZ(cbind(coordinates(red.cov.for), rowSums(pc))))
+plot(realmap2, col=heat.colors(7))
+title("Potential connectivity")
+
+# density-weighted (or realized) connectivity.
+potmap2 <- rasterFromXYZ(cbind(coordinates(red.cov.for), dwc))
+plot(potmap2, col=rev(greenmono[1:7]))
+title("DWC")
+```
+
+
+# References
+
+Morin, D. J., A. K. Fuller, J. A. Royle, and C. Sutherland. 2017. Model-based estimators of density and connectivity to inform conservation of spatially structured populations. Ecosphere 8(1):e01623. 10.1002/ecs2.1623
+
+Royle, J. A., R. B. Chandler, K. D. Gazenski, and T. A. Graves. 2013. Spatial capture-recapture models for jointly estimating population density and landscape connectivity. Ecology 94:287–294.
+
+Sutherland, C., A. K. Fuller, and J. A. Royle. 2015. Modelling non-Euclidean movement and landscape connectivity in highly structured ecological networks. Methods in Ecology and Evolution 6:169–177.
+

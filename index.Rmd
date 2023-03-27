@@ -30,7 +30,7 @@ In their 2017 paper, Dana Morin and colleagues used data collected on black bear
 
 Briefly speaking, the method relies on standard SCR models in which the euclidean distance between activity centers and traps is replaced by an ecological distance with least-cost path distance that uses a landscape covariate to inform the model about how space is used. 
 
-In their appendix 3, the authors provide the data and some R code to fit a spatial capture-recapture model using ecological distance (vs. euclidian distance), calculate realized density and connectivity measures such potential connectivity and density-weighted connectivity. 
+In their appendix 3, the authors provide the data and some R code to fit a spatial capture-recapture model using ecological distance (vs. euclidian distance), calculate realized density and connectivity measures such as potential connectivity and density-weighted connectivity. 
 
 Here, I try and reproduce their results using the R package `oSCR`.
 
